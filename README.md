@@ -1,2 +1,2 @@
-# checkmates-smart-contracts
-smart contract for the Checkmates mini app.
+# squabble-smart-contracts
+smart contract for the Squabble mini app.
