@@ -147,7 +147,7 @@ contract Squabble is Ownable, Pausable {
         games[gameId].players[0] = creator;
         playerGames[creator][gameId] = true;
 
-        if (!IERC20(usdcAddress).transferFrom(creator, address(this), stakeAmount)) revert TransferFailed();
+        if (!IERC20(usdcAddress).transferFrom(msg.sender, address(this), stakeAmount)) revert TransferFailed();
         emit GameCreated(gameId, creator, stakeAmount);
     }
 
@@ -196,7 +196,7 @@ contract Squabble is Ownable, Pausable {
         games[id].playerCount++;
         games[id].totalStakeGame += games[id].stakeAmount;
 
-        if (!IERC20(usdcAddress).transferFrom(player, address(this), games[id].stakeAmount)) revert TransferFailed();
+        if (!IERC20(usdcAddress).transferFrom(msg.sender, address(this), games[id].stakeAmount)) revert TransferFailed();
 
         emit GameJoined(id, player);
     }
