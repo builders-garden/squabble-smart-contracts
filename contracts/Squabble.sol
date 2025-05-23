@@ -37,6 +37,7 @@ contract Squabble is Ownable, Pausable {
     event GameJoined(uint256 id, address player2);                          // Emitted when player joins game
     event GameStarted(uint256 id);                                          // Emitted when game starts
     event GameEnded(uint256 id, address playerWinner);                      // Emitted when game ends
+    event WithdrawFromGame(uint256 id, address player);                     // Emitted when player withdraws from game
 
     /// @notice Game status enum
     enum GameStatus {
@@ -157,11 +158,28 @@ contract Squabble is Ownable, Pausable {
         if (games[id].status != GameStatus.PENDING) revert GameNotPending();
         if (msg.sender != games[id].creator) revert Unauthorized();
 
-        games[id].status = GameStatus.ENDED;
-        games[id].totalStakeGame = 0;
+        // Store values before deletion
+        address creator = games[id].creator;
+        uint256 stakeAmount = games[id].stakeAmount;
+        address[] memory players = games[id].players;
 
-        if (!IERC20(usdcAddress).transfer(games[id].creator, games[id].stakeAmount)) revert TransferFailed();
-        emit GameDeleted(id, games[id].creator, games[id].stakeAmount);
+        // Clean up player mappings for all players in the game
+        for (uint256 i = 0; i < games[id].playerCount; i++) {
+            if (games[id].players[i] != address(0)) {
+                delete playerGames[games[id].players[i]][id];
+            }
+        }
+
+        // Delete the game from mapping
+        delete games[id];
+
+        // Transfer the stake back to creator and players
+        for (uint256 i = 0; i < players.length; i++) {
+            if (players[i] != address(0)) {
+                if (!IERC20(usdcAddress).transfer(players[i], stakeAmount)) revert TransferFailed();
+            }
+        }
+        emit GameDeleted(id, creator, stakeAmount);
     }
 
     /// @notice Join an existing game
@@ -181,6 +199,44 @@ contract Squabble is Ownable, Pausable {
         if (!IERC20(usdcAddress).transferFrom(player, address(this), games[id].stakeAmount)) revert TransferFailed();
 
         emit GameJoined(id, player);
+    }
+
+    /// @notice Withdraw from a game
+    /// @param id The ID of the game to withdraw from
+    function withdrawFromGame(uint256 id) public {
+        if (!gameExists(id)) revert GameDoesNotExist(id);
+        if (games[id].status != GameStatus.PENDING) revert GameNotPending();
+        if (!playerGames[msg.sender][id]) revert Unauthorized();
+
+        // Find player's index in the array
+        uint256 playerIndex = 0;
+        bool found = false;
+        for (uint256 i = 0; i < games[id].playerCount; i++) {
+            if (games[id].players[i] == msg.sender) {
+                playerIndex = i;
+                found = true;
+                break;
+            }
+        }
+        
+        if (!found) revert Unauthorized();
+
+        // Remove player from mapping
+        playerGames[msg.sender][id] = false;
+        
+        // Remove player from array by shifting elements left
+        for (uint256 i = playerIndex; i < games[id].playerCount - 1; i++) {
+            games[id].players[i] = games[id].players[i + 1];
+        }
+        
+        // Clear the last slot and update counts
+        games[id].players[games[id].playerCount - 1] = address(0);
+        games[id].playerCount--;
+        games[id].totalStakeGame -= games[id].stakeAmount;
+
+        if (!IERC20(usdcAddress).transfer(msg.sender, games[id].stakeAmount)) revert TransferFailed();
+
+        emit WithdrawFromGame(id, msg.sender);
     }
 
     /// @notice Start a game
@@ -213,7 +269,7 @@ contract Squabble is Ownable, Pausable {
         }
         
         // Handle winner case
-        if (playerWinner >= games[id].playerCount - 1) revert InvalidPlayerIndex();
+        if (playerWinner > games[id].playerCount - 1) revert InvalidPlayerIndex();
         
         games[id].status = GameStatus.ENDED;
         address playerWinnerAddress = games[id].players[playerWinner];
