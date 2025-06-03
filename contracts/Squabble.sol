@@ -12,11 +12,14 @@ pragma solidity ^0.8.28;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+//remove address array of partecipants -> the admin can set the player winning!
 
 /// @title Squabble
 /// @notice A smart contract for managing multiplayer games with USDC stakes
 /// @dev Implements game creation, joining, and winner determination with USDC token integration
-contract Squabble is Ownable, Pausable {
+contract Squabble is Ownable, Pausable, ReentrancyGuard {
     // Custom Errors
     error ZeroAddress();                    // Thrown when address(0) is used
     error InvalidBetAmount();               // Thrown when stake amount is invalid
@@ -33,12 +36,12 @@ contract Squabble is Ownable, Pausable {
     error GameNotEnoughPlayers();          // Thrown when game has less than 2 players
 
     // Events
-    event GameCreated(uint256 id, address creator, uint256 stakeAmount);    // Emitted when new game is created
-    event GameDeleted(uint256 id, address creator, uint256 stakeAmount);    // Emitted when game is deleted
-    event GameJoined(uint256 id, address player2);                          // Emitted when player joins game
-    event GameStarted(uint256 id);                                          // Emitted when game starts
-    event GameEnded(uint256 id, address playerWinner);                      // Emitted when game ends
-    event WithdrawFromGame(uint256 id, address player);                     // Emitted when player withdraws from game
+    event GameCreated(uint256 id, uint256 stakeAmount);    // Emitted when new game is created
+    event GameDeleted(uint256 id, uint256 stakeAmount);    // Emitted when game is deleted
+    event GameJoined(uint256 id, address player);          // Emitted when player joins game
+    event GameStarted(uint256 id);                         // Emitted when game starts
+    event GameEnded(uint256 id, address playerWinner);     // Emitted when game ends
+    event WithdrawFromGame(uint256 id, address player);    // Emitted when player withdraws from game
 
     /// @notice Game status enum
     enum GameStatus {
@@ -50,7 +53,6 @@ contract Squabble is Ownable, Pausable {
 
     /// @notice Game struct containing all game information
     struct Game {
-        address creator;        // Address of game creator
         address playerWinner;   // Address of the winner
         address[] players;      // Array of player addresses
         uint256 stakeAmount;    // Amount each player needs to stake
@@ -63,26 +65,23 @@ contract Squabble is Ownable, Pausable {
     // State Variables
     address public usdcAddress;
     uint256[] public gameIds;
+    
     // Constants
     uint256 public constant MAX_STAKE = 1000e6;    // Maximum stake amount (1000 USDC)
     uint256 public constant MAX_PLAYERS = 6;        // Maximum players per game
+    uint256 public constant DRAW_INDICATOR = 10;    // Value used to indicate a draw
     
     // Mapping of game ID to Game struct
     mapping(uint256 => Game) public games;     
     // Mapping of player to game participation
     mapping(address => mapping(uint256 => bool)) public playerGames; 
-    
-    /// @notice Modifier to restrict access to game creator or admin
-    /// @param id The game ID to check
-    modifier onlyCreatorOrAdmin(uint256 id) {
-        if (msg.sender != games[id].creator && msg.sender != owner()) revert Unauthorized();
-        _;
-    }
 
     /// @notice Constructor to initialize the contract
     /// @param _usdcAddress The address of the USDC token contract
     /// @param _owner The address of the contract owner
     constructor(address _usdcAddress, address _owner) Ownable(_owner) {
+        if (_usdcAddress == address(0)) revert ZeroAddress();
+        if (_owner == address(0)) revert ZeroAddress();
         usdcAddress = _usdcAddress;
     }
 
@@ -93,27 +92,39 @@ contract Squabble is Ownable, Pausable {
         return games[id];
     }
 
-    /// @notice Get a range of games
-    /// @param start The starting game ID
-    /// @param end The ending game ID
+    /// @notice Get a range of games by array indices (not game IDs)
+    /// @param startIndex The starting index in the gameIds array
+    /// @param endIndex The ending index in the gameIds array
     /// @return Game[] Array of games within the specified range
-    function getGames(uint256 start, uint256 end) public view returns (Game[] memory) {
-        if (start > end) revert InvalidGameRange();
-        if (end > gameIds.length) revert InvalidGameRange();
+    function getGames(uint256 startIndex, uint256 endIndex) public view returns (Game[] memory) {
+        if (startIndex > endIndex) revert InvalidGameRange();
+        if (endIndex >= gameIds.length) revert InvalidGameRange();
         
-        Game[] memory gamesArray = new Game[](end - start + 1);
-        for (uint256 i = start; i <= end; i++) {
-            if (!gameExists(i)) revert GameDoesNotExist(i);
-            gamesArray[i - start] = games[i];
+        Game[] memory gamesArray = new Game[](endIndex - startIndex + 1);
+        for (uint256 i = startIndex; i <= endIndex; i++) {
+            uint256 gameId = gameIds[i];
+            gamesArray[i - startIndex] = games[gameId];
         }
         return gamesArray;
+    }
+
+    /// @notice Get all game IDs
+    /// @return uint256[] Array of all game IDs
+    function getAllGameIds() public view returns (uint256[] memory) {
+        return gameIds;
+    }
+
+    /// @notice Get the total number of games
+    /// @return uint256 Total number of games created
+    function getTotalGames() public view returns (uint256) {
+        return gameIds.length;
     }
 
     /// @notice Check if a game exists
     /// @param id The game ID to check
     /// @return bool True if game exists, false otherwise
     function gameExists(uint256 id) public view returns (bool) {
-        return games[id].creator != address(0);
+        return games[id].gameId != 0;
     }
 
     /// @notice Pause the contract
@@ -127,15 +138,13 @@ contract Squabble is Ownable, Pausable {
     }
 
     /// @notice Create a new game
-    /// @param creator The address of the creator
+    /// @param gameId The ID of the game to create
     /// @param stakeAmount The amount of USDC to bet
-    function createGame(uint256 gameId, address creator, uint256 stakeAmount) public onlyOwner whenNotPaused {
-        if (creator == address(0)) revert ZeroAddress();
+    function createGame(uint256 gameId, uint256 stakeAmount) public onlyOwner whenNotPaused {
         if (stakeAmount > MAX_STAKE) revert InvalidBetAmount();
         if (gameExists(gameId)) revert GameAlreadyExists(gameId);
 
         games[gameId] = Game({
-            creator: creator,
             playerWinner: address(0),
             players: new address[](MAX_PLAYERS),
             stakeAmount: stakeAmount,
@@ -146,7 +155,7 @@ contract Squabble is Ownable, Pausable {
         });
         gameIds.push(gameId);
 
-        emit GameCreated(gameId, creator, stakeAmount);
+        emit GameCreated(gameId, stakeAmount);
     }
 
     /// @notice Join an existing game
@@ -163,14 +172,16 @@ contract Squabble is Ownable, Pausable {
         games[id].playerCount++;
         games[id].totalStakeGame += games[id].stakeAmount;
 
-        if (!IERC20(usdcAddress).transferFrom(msg.sender, address(this), games[id].stakeAmount)) revert TransferFailed();
+        if (games[id].stakeAmount > 0) {
+            if (!IERC20(usdcAddress).transferFrom(msg.sender, address(this), games[id].stakeAmount)) revert TransferFailed();
+        }
 
         emit GameJoined(id, player);
     }
 
     /// @notice Withdraw from a game
     /// @param id The ID of the game to withdraw from
-    function withdrawFromGame(uint256 id) public {
+    function withdrawFromGame(uint256 id) public nonReentrant {
         if (!gameExists(id)) revert GameDoesNotExist(id);
         if (games[id].status != GameStatus.PENDING) revert GameNotPending();
         if (!playerGames[msg.sender][id]) revert Unauthorized();
@@ -201,14 +212,16 @@ contract Squabble is Ownable, Pausable {
         games[id].playerCount--;
         games[id].totalStakeGame -= games[id].stakeAmount;
 
-        if (!IERC20(usdcAddress).transfer(msg.sender, games[id].stakeAmount)) revert TransferFailed();
+        if (games[id].stakeAmount > 0) {
+            if (!IERC20(usdcAddress).transfer(msg.sender, games[id].stakeAmount)) revert TransferFailed();
+        }
 
         emit WithdrawFromGame(id, msg.sender);
     }
 
     /// @notice Start a game
     /// @param id The ID of the game to start
-    function startGame(uint256 id) onlyCreatorOrAdmin(id) public whenNotPaused {
+    function startGame(uint256 id) onlyOwner public whenNotPaused {
         if (!gameExists(id)) revert GameDoesNotExist(id);
         if (games[id].status != GameStatus.PENDING) revert GameNotPending();
         if (games[id].playerCount < 2) revert GameNotEnoughPlayers();
@@ -219,18 +232,20 @@ contract Squabble is Ownable, Pausable {
 
     /// @notice Set the winner of a game and distribute the prize
     /// @param id The ID of the game
-    /// @param playerWinner The winner (0 for first player, 1 for second player, etc., 10 for draw)
-    function setGameWinner(uint256 id, uint256 playerWinner) onlyOwner public {
+    /// @param playerWinner The winner (0 for first player, 1 for second player, etc., DRAW_INDICATOR for draw)
+    function setGameWinner(uint256 id, uint256 playerWinner) onlyOwner public nonReentrant {
         if (!gameExists(id)) revert GameDoesNotExist(id);
         if (games[id].status != GameStatus.PLAYING) revert GameNotPlaying();
         
         // Handle draw case
-        if (playerWinner == 10) {
+        if (playerWinner == DRAW_INDICATOR) {
             games[id].status = GameStatus.ENDED;
             address playerDrawAddress = address(0);
             // Refund all players their stake
             for (uint256 i = 0; i < games[id].playerCount; i++) {
-                if (!IERC20(usdcAddress).transfer(games[id].players[i], games[id].stakeAmount)) revert TransferFailed();
+                if (games[id].stakeAmount > 0) {
+                    if (!IERC20(usdcAddress).transfer(games[id].players[i], games[id].stakeAmount)) revert TransferFailed();
+                }
             }
             emit GameEnded(id, playerDrawAddress);
             return;
@@ -243,7 +258,9 @@ contract Squabble is Ownable, Pausable {
         address playerWinnerAddress = games[id].players[playerWinner];
         games[id].playerWinner = playerWinnerAddress;
         
-        if (!IERC20(usdcAddress).transfer(playerWinnerAddress, games[id].totalStakeGame)) revert TransferFailed();
+        if (games[id].totalStakeGame > 0) {
+            if (!IERC20(usdcAddress).transfer(playerWinnerAddress, games[id].totalStakeGame)) revert TransferFailed();
+        }
         emit GameEnded(id, playerWinnerAddress);
     }
 }
