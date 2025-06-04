@@ -14,10 +14,8 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-//remove address array of partecipants -> the admin can set the player winning!
-
 /// @title Squabble
-/// @notice A smart contract for managing multiplayer games with USDC stakes
+/// @notice A smart contract for managing multiplayer games with USDC stakes. Users can pay with any token using a system like Daimo Pay.
 /// @dev Implements game creation, joining, and winner determination with USDC token integration
 contract Squabble is Ownable, Pausable, ReentrancyGuard {
     // Custom Errors
@@ -29,18 +27,15 @@ contract Squabble is Ownable, Pausable, ReentrancyGuard {
     error TransferFailed();                 // Thrown when USDC transfer fails
     error Unauthorized();                   // Thrown when caller is not authorized
     error GameFull(uint256 id);             // Thrown when game has reached max players
-    error InvalidPlayerIndex();             // Thrown when player index is invalid
     error InvalidGameRange();               // Thrown when game range is invalid
-    error GameDoesNotExist(uint256 id);     // Thrown when game doesn't exist
     error GameAlreadyExists(uint256 id);   // Thrown when game already exists
     error GameNotEnoughPlayers();          // Thrown when game has less than 2 players
 
     // Events
     event GameCreated(uint256 id, uint256 stakeAmount);    // Emitted when new game is created
-    event GameDeleted(uint256 id, uint256 stakeAmount);    // Emitted when game is deleted
     event GameJoined(uint256 id, address player);          // Emitted when player joins game
     event GameStarted(uint256 id);                         // Emitted when game starts
-    event GameEnded(uint256 id, address playerWinner);     // Emitted when game ends
+    event GameEnded(bool isDraw, uint256 id, address playerWinner);     // Emitted when game ends
     event WithdrawFromGame(uint256 id, address player);    // Emitted when player withdraws from game
 
     /// @notice Game status enum
@@ -54,7 +49,6 @@ contract Squabble is Ownable, Pausable, ReentrancyGuard {
     /// @notice Game struct containing all game information
     struct Game {
         address playerWinner;   // Address of the winner
-        address[] players;      // Array of player addresses
         uint256 stakeAmount;    // Amount each player needs to stake
         uint256 totalStakeGame; // Total amount staked in the game
         uint256 gameId;         // Unique identifier for the game
@@ -69,7 +63,6 @@ contract Squabble is Ownable, Pausable, ReentrancyGuard {
     // Constants
     uint256 public constant MAX_STAKE = 1000e6;    // Maximum stake amount (1000 USDC)
     uint256 public constant MAX_PLAYERS = 6;        // Maximum players per game
-    uint256 public constant DRAW_INDICATOR = 10;    // Value used to indicate a draw
     
     // Mapping of game ID to Game struct
     mapping(uint256 => Game) public games;     
@@ -146,7 +139,6 @@ contract Squabble is Ownable, Pausable, ReentrancyGuard {
 
         games[gameId] = Game({
             playerWinner: address(0),
-            players: new address[](MAX_PLAYERS),
             stakeAmount: stakeAmount,
             totalStakeGame: 0,
             gameId: gameId,
@@ -162,13 +154,11 @@ contract Squabble is Ownable, Pausable, ReentrancyGuard {
     /// @param id The ID of the game to join
     /// @param player The address of the player joining
     function joinGame(uint256 id, address player) public whenNotPaused {
-        if (!gameExists(id)) revert GameDoesNotExist(id);
         if (games[id].status != GameStatus.PENDING) revert GameNotPending();
         if (playerGames[player][id]) revert GameAlreadyHasPlayer();
         if (games[id].playerCount >= MAX_PLAYERS) revert GameFull(id);
 
         playerGames[player][id] = true;
-        games[id].players[games[id].playerCount] = player;
         games[id].playerCount++;
         games[id].totalStakeGame += games[id].stakeAmount;
 
@@ -182,33 +172,13 @@ contract Squabble is Ownable, Pausable, ReentrancyGuard {
     /// @notice Withdraw from a game
     /// @param id The ID of the game to withdraw from
     function withdrawFromGame(uint256 id) public nonReentrant {
-        if (!gameExists(id)) revert GameDoesNotExist(id);
         if (games[id].status != GameStatus.PENDING) revert GameNotPending();
         if (!playerGames[msg.sender][id]) revert Unauthorized();
-
-        // Find player's index in the array
-        uint256 playerIndex = 0;
-        bool found = false;
-        for (uint256 i = 0; i < games[id].playerCount; i++) {
-            if (games[id].players[i] == msg.sender) {
-                playerIndex = i;
-                found = true;
-                break;
-            }
-        }
-        
-        if (!found) revert Unauthorized();
 
         // Remove player from mapping
         playerGames[msg.sender][id] = false;
         
-        // Remove player from array by shifting elements left
-        for (uint256 i = playerIndex; i < games[id].playerCount - 1; i++) {
-            games[id].players[i] = games[id].players[i + 1];
-        }
-        
-        // Clear the last slot and update counts
-        games[id].players[games[id].playerCount - 1] = address(0);
+        // Update counts
         games[id].playerCount--;
         games[id].totalStakeGame -= games[id].stakeAmount;
 
@@ -222,7 +192,6 @@ contract Squabble is Ownable, Pausable, ReentrancyGuard {
     /// @notice Start a game
     /// @param id The ID of the game to start
     function startGame(uint256 id) onlyOwner public whenNotPaused {
-        if (!gameExists(id)) revert GameDoesNotExist(id);
         if (games[id].status != GameStatus.PENDING) revert GameNotPending();
         if (games[id].playerCount < 2) revert GameNotEnoughPlayers();
 
@@ -232,35 +201,32 @@ contract Squabble is Ownable, Pausable, ReentrancyGuard {
 
     /// @notice Set the winner of a game and distribute the prize
     /// @param id The ID of the game
-    /// @param playerWinner The winner (0 for first player, 1 for second player, etc., DRAW_INDICATOR for draw)
-    function setGameWinner(uint256 id, uint256 playerWinner) onlyOwner public nonReentrant {
-        if (!gameExists(id)) revert GameDoesNotExist(id);
+    /// @param playerWinner The address of the winning player (address(0) for draw)
+    /// @param players The array of players in the game to refund. Only used for draws.
+    function setGameWinner(uint256 id, address playerWinner, address[] memory players) onlyOwner public nonReentrant {
         if (games[id].status != GameStatus.PLAYING) revert GameNotPlaying();
         
-        // Handle draw case
-        if (playerWinner == DRAW_INDICATOR) {
-            games[id].status = GameStatus.ENDED;
-            address playerDrawAddress = address(0);
-            // Refund all players their stake
-            for (uint256 i = 0; i < games[id].playerCount; i++) {
-                if (games[id].stakeAmount > 0) {
-                    if (!IERC20(usdcAddress).transfer(games[id].players[i], games[id].stakeAmount)) revert TransferFailed();
+        games[id].status = GameStatus.ENDED;
+        games[id].playerWinner = playerWinner;
+        
+        // Handle draw case (playerWinner is address(0))
+        if (playerWinner == address(0)) {
+            // For draws, refund players
+            if (games[id].totalStakeGame > 0) {
+                for (uint256 i = 0; i < players.length; i++) {
+                    if (players[i] != address(0)) {
+                        if (!IERC20(usdcAddress).transfer(players[i], games[id].stakeAmount)) revert TransferFailed();
+                    }
                 }
             }
-            emit GameEnded(id, playerDrawAddress);
+            emit GameEnded(true, id, address(0));
             return;
         }
         
-        // Handle winner case
-        if (playerWinner >= games[id].playerCount) revert InvalidPlayerIndex();
-        
-        games[id].status = GameStatus.ENDED;
-        address playerWinnerAddress = games[id].players[playerWinner];
-        games[id].playerWinner = playerWinnerAddress;
-        
+        // Handle winner case - transfer all stakes to winner
         if (games[id].totalStakeGame > 0) {
-            if (!IERC20(usdcAddress).transfer(playerWinnerAddress, games[id].totalStakeGame)) revert TransferFailed();
+            if (!IERC20(usdcAddress).transfer(playerWinner, games[id].totalStakeGame)) revert TransferFailed();
         }
-        emit GameEnded(id, playerWinnerAddress);
+        emit GameEnded(false, id, playerWinner);
     }
 }
